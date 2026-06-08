@@ -48,26 +48,64 @@ The codebase operates via compile-time capabilities. Features (`zk`, `field-inli
 
 ---
 
-## 3. PCS Interfacing & Modularity
+## 3. PCS Interfacing & Modularity: An In-Depth Analysis
 
-The prover interacts with the Polynomial Commitment Scheme (PCS) strictly through traits defined in `jolt-openings`. Concrete implementations (like `DoryScheme` from `jolt-dory`) are treated as implementation details.
+The new Jolt architecture achieves cryptographic modularity by completely abstracting the Polynomial Commitment Scheme (PCS) behind a hierarchy of traits found in the `jolt-openings` crate. The core goal is that `jolt-prover` orchestrates the *protocol schedule* (which polynomial to commit to, which to open, and when), while the PCS itself defines the *algebraic implementation* (how to compress vectors, how to stream, how to achieve zero-knowledge).
 
-### How We Interface
-`jolt-prover` depends on traits such as:
-- `CommitmentScheme`
-- `StreamingCommitment`
-- `AdditivelyHomomorphic`
-- `ZkOpeningScheme`
+This strict separation means replacing the PCS (e.g., swapping Dory for HyperKZG or Brakedown) requires zero changes to the complex Jolt sumcheck protocol paths.
 
-**Stage 0 (Commitments)**: The prover maps `jolt-witness` streams into `CommitmentRequest`s. The backend processes these streams (potentially using coarse-grained, optimized CPU streams or GPU acceleration) and returns `CommittedPolynomialOutput` containing `PCS::Output` and `PCS::OpeningHint`.
+### The Trait Hierarchy (`jolt-openings`)
 
-**Stage 8 (Final Opening)**: The prover constructs a structured, typed `OpeningRequest` (containing `RamInc`, `RdInc`, `Ra`s, etc.). The PCS traits (`PCS::combine`, `PCS::open_poly`, `PCS::open_zk_poly`) natively handle combining the commitments using the transcript-derived Gamma powers. `jolt-prover` retains the hints and evaluations without needing to peek into the inner struct of the Dory proof.
+To support everything from hardware acceleration (via `jolt-backends`) to Zero-Knowledge, the PCS abstractions are divided into highly specialized traits. Here is the in-depth breakdown of every trait involved, its usage, and its necessity:
 
-### Ease of Replacing PCS
-Because the entire backend math is isolated behind generic traits in `jolt-openings` and `jolt-backends::CommitmentBackend`, replacing Dory with another PCS (e.g., HyperKZG, Brakedown) is highly modular:
-1. Implement the `CommitmentScheme` and `ZkOpeningScheme` traits for the new scheme.
-2. Provide the type bound (`PCS = NewScheme`) when invoking `jolt_prover::prove`.
-3. The prover will naturally route `NewScheme::Output` and `NewScheme::OpeningHint` throughout the stages. No manual transcript adjustment or stage rewriting is required as `jolt-prover` solely orchestrates the bounds.
+#### 1. `CommitmentScheme`
+**Necessity:** This is the foundational trait. It defines the base parameters of the commitment scheme (the Field, the Proof type, the Prover/Verifier Setup) and the required mathematical operations (commit, open, verify).
+**Usage:**
+- **Types:** It defines associated types such as `Output` (the commitment itself) and `OpeningHint`. The `OpeningHint` is crucial for performance: when a prover commits to a polynomial, the PCS can return auxiliary data (like intermediate tree nodes or row-commitments in Dory) that are saved and passed directly to the `open` function later, preventing redundant computation.
+- **Methods:** `commit()` transforms a polynomial into an `Output` and `OpeningHint`. `open()` evaluates the polynomial at a challenge point `r`, producing a `Proof`. `verify()` is used by the verifier to check the proof against the evaluation and `Output`.
+
+#### 2. `AdditivelyHomomorphic`
+**Necessity:** Jolt's final Stage 8 opening is heavily optimized. Instead of opening dozens of polynomials (RAM, Registers, Advice) individually, the protocol groups them together using a Random Linear Combination (RLC). This trait guarantees the PCS can algebraically combine commitments without reconstructing the source polynomials.
+**Usage:**
+- **Methods:** Provides `combine(commitments, scalars)` and `combine_hints()`.
+- In `jolt-prover` Stage 8, once the Fiat-Shamir `Gamma` challenges are squeezed, the prover calls `PCS::combine` to fold `N` commitments into a single `JointCommitment`. It simultaneously folds the `OpeningHints` to build the joint opening proof instantly.
+
+#### 3. `StreamingCommitment`
+**Necessity:** Jolt traces can be gigabytes in size. Materializing a massive, dense vector in memory simply to commit to it would cause Out-Of-Memory (OOM) panics. `StreamingCommitment` allows the backend to feed data to the PCS in chunks, keeping the memory footprint minimal.
+**Usage:**
+- **Methods:** `begin()`, `feed()`, `feed_zeros()`, `feed_u64()`, `process_one_hot_chunk()`, and `finish()`.
+- **Integration:** The `jolt-backends` (like the CPU backend) uses this heavily in Stage 0. The witness provider yields a stream of elements (dense, sparse zeros, or one-hot index chunks). The CPU backend feeds these sequentially into a `PartialCommitment` state machine. For sparse matrices (like RA tables), `process_one_hot_chunk` bypasses dense memory materialization entirely by committing only to the activated indices.
+
+#### 4. `ZkOpeningScheme`
+**Necessity:** Standard PCS openings reveal the underlying evaluation $f(r)$. In Zero-Knowledge mode (BlindFold), the prover must convince the verifier that the joint polynomial evaluates correctly without exposing the actual evaluation value.
+**Usage:**
+- **Types:** Introduces `HidingCommitment` (typically a Pedersen commitment, e.g., `Bn254G1`) and `Blind` (the randomness scalar).
+- **Methods:** `commit_zk()` overrides the standard commit with hiding parameters. `open_zk()` creates an opening proof that is bound to the `HidingCommitment` rather than the cleartext field evaluation.
+- `jolt-prover` dynamically switches to these methods if `cfg(feature = "zk")` is enabled, natively integrating the PCS's ZK capability with BlindFold's R1CS logic without knowing how the PCS achieves ZK natively.
+
+#### 5. `ZkStreamingCommitment`
+**Necessity:** An intersection trait to ensure that even when ZK mode is enabled, the prover does not lose the OOM-preventing streaming capabilities.
+**Usage:**
+- **Methods:** `finish_zk_with_hint()`, `finish_zk_one_hot_column_major_chunks()`.
+- Allows `jolt-backends` to finalize a streamed trace chunk while still properly injecting the blinding factors necessary for `open_zk()` later.
+
+### Backend Orchestration (`jolt-backends` and `jolt-dory`)
+
+**The Backend Abstraction:**
+`jolt-prover` does not call `PCS::commit` directly. Instead, `jolt-prover` constructs a `CommitmentRequest` representing the necessary protocol view (e.g. "I need the RamInc polynomial stream"). It passes this request to the generic `CommitmentBackend` trait. The concrete backend (e.g. `jolt_backends::cpu::CpuBackend`) then reads the `jolt-witness` streams, optimizes the chunking, and calls `PCS::feed` on the `StreamingCommitment`.
+
+**The Implementation (`jolt-dory`):**
+If you look inside `crates/jolt-dory/src`, the `DoryScheme` implements all the aforementioned traits:
+- In `scheme.rs`, it maps `CommitmentScheme` types to `DoryProof`, `DoryProverSetup`, and `DoryHint`.
+- It implements `AdditivelyHomomorphic` by performing elliptic curve group additions (using `rayon` for parallelization).
+- In `streaming.rs`, it implements `StreamingCommitment` where `PartialCommitment` holds a vector of row-commitments that are aggregated hierarchically on `finish()`.
+
+### Summary of Ease of Replacement
+Replacing the PCS is fully decoupled from Jolt's intricate trace processing and sumchecks:
+1. **Develop a new crate** (e.g., `jolt-hyperkzg`).
+2. **Implement the 5 traits** from `jolt-openings` on your target struct (e.g., `HyperKzgScheme`).
+3. **Inject via Generics**: Start the prover using `jolt_prover::prove::<HyperKzgScheme, ...>`.
+4. `jolt-prover` routes the math, `jolt-backends` manages the streaming limits, and `jolt-verifier` expects the new `HyperKzgScheme::Proof` in the payload. No sumcheck or transcript code requires modification.
 
 ---
 
